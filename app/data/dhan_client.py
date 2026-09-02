@@ -57,9 +57,9 @@ class DhanClient:
             return self._post(path, payload, _retry=_retry + 1)
         if resp.status_code != 200:
             hint = ""
-            if "DH-907" in resp.text or "DH-905" in resp.text:
+            if "unable to fetch data due to incorrect parameters or no data present" in resp.text:
                 hint = (
-                    " [Known DhanHQ-side /charts/historical instability (error DH-905/DH-907) -- "
+                    " [Known DhanHQ-side /charts/historical instability (error DH-907) -- "
                     "not a request-formatting bug here; this exact call can fail intermittently "
                     "even with correct parameters. Retry later or check Dhan API status.]"
                 )
