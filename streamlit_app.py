@@ -13,12 +13,24 @@ import streamlit as st
 from app import config
 from app.alerts import notifiers
 from app.alerts.rules import ALL_CONDITIONS, ALL_LEVELS, default_rules
+from app.backtest.expiry_calendar import CURRENT_REGIME_START, months_between
+from app.backtest.historical_levels import HistoricalDataError, reconstruct_monthly_cycle
+from app.backtest.level_stats import aggregate_level_stats, analyze_cycle
+from app.backtest.price_series import PriceSeriesError, get_cycle_price_series
+from app.backtest.results import compute_results, compute_results_by_level, compute_results_by_strategy
+from app.backtest.simulator import simulate_cycle
+from app.backtest.strategy import DEFAULT_STRATEGIES, StrategyConfig
 from app.data.dhan_client import DhanClient, DhanApiError
 from app.data.dhan_constants import EXCHANGE_SEGMENT_NSE_EQ, INSTRUMENT_EQUITY
 from app.data.universe import get_fno_universe
 from app.db import database as db
 from app.engine.confirmation import ConfirmationConfig
 from app import pipeline
+
+
+def backtest_month_options(last_completed_year: int, last_completed_month: int) -> list[str]:
+    start_year, start_month = CURRENT_REGIME_START.year, CURRENT_REGIME_START.month
+    return [f"{y:04d}-{m:02d}" for y, m in months_between(start_year, start_month, last_completed_year, last_completed_month)]
 
 st.set_page_config(page_title="NSE F&O Straddle S/R Scanner", layout="wide")
 db.init_db()
@@ -176,6 +188,7 @@ df = pd.DataFrame(rows)
     tab_alerts,
     tab_chart,
     tab_audit,
+    tab_backtest,
 ) = st.tabs(
     [
         "All F&O Stocks",
@@ -187,6 +200,7 @@ df = pd.DataFrame(rows)
         "Alerts",
         "Chart",
         "Calculation Audit",
+        "Backtest",
     ]
 )
 
@@ -456,3 +470,143 @@ with tab_audit:
     st.subheader("Historical monthly cycles")
     hist_df = pd.DataFrame([dict(r) for r in history])
     st.dataframe(hist_df, use_container_width=True)
+
+with tab_backtest:
+    st.subheader("Backtest")
+    st.warning(
+        "Trades the underlying EQUITY/SPOT price, not actual CE/PE options -- the level "
+        "calculation itself still uses the real ATM CE+PE straddle. Historical S/R levels are "
+        "reconstructed from NSE's official Bhav Copy, scoped to the verified current Tuesday-"
+        "expiry regime (2025-09-01 onward). P&L is a simple per-trade % return, not a "
+        "compounded equity curve or capital-sized portfolio. These are backtested scanner "
+        "signals, not guaranteed future performance."
+    )
+
+    today = date.today()
+    last_completed_year, last_completed_month = (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
+
+    bc1, bc2, bc3 = st.columns(3)
+    with bc1:
+        bt_symbols = st.multiselect(
+            "Stocks", sorted(s.symbol for s in stocks), default=["RELIANCE"], key="bt_symbols"
+        )
+    with bc2:
+        bt_start = st.selectbox(
+            "Start month", backtest_month_options(last_completed_year, last_completed_month),
+            index=0, key="bt_start",
+        )
+    with bc3:
+        bt_end = st.selectbox(
+            "End month", backtest_month_options(last_completed_year, last_completed_month),
+            index=len(backtest_month_options(last_completed_year, last_completed_month)) - 1, key="bt_end",
+        )
+
+    bc4, bc5, bc6 = st.columns(3)
+    with bc4:
+        bt_strategy_names = st.multiselect(
+            "Strategies", [s.name for s in DEFAULT_STRATEGIES],
+            default=[s.name for s in DEFAULT_STRATEGIES], key="bt_strategies",
+        )
+    with bc5:
+        bt_stop = st.number_input("Stop loss %", min_value=0.5, max_value=20.0, value=2.0, step=0.5)
+    with bc6:
+        bt_target = st.number_input("Target %", min_value=0.5, max_value=20.0, value=4.0, step=0.5)
+    bt_max_hold = st.number_input("Max holding days", min_value=1, max_value=60, value=10)
+
+    if st.button("Run backtest", use_container_width=True, key="run_backtest"):
+        if not bt_symbols:
+            st.error("Select at least one stock.")
+        else:
+            start_y, start_m = map(int, bt_start.split("-"))
+            end_y, end_m = map(int, bt_end.split("-"))
+            months = months_between(start_y, start_m, end_y, end_m)
+            selected_strategies = tuple(
+                StrategyConfig(s.name, s.level_types, s.trigger_reaction, s.direction, bt_stop, bt_target, int(bt_max_hold))
+                for s in DEFAULT_STRATEGIES if s.name in bt_strategy_names
+            )
+
+            client = DhanClient()
+            all_trades = []
+            all_level_events = []
+            errors = []
+            progress = st.progress(0.0, text="Starting backtest...")
+            total = len(bt_symbols) * len(months)
+            done = 0
+
+            for symbol in bt_symbols:
+                stock_obj = next(s for s in stocks if s.symbol == symbol)
+                for y, m in months:
+                    done += 1
+                    progress.progress(done / total, text=f"{symbol} {y}-{m:02d} ({done}/{total})")
+                    try:
+                        cycle = reconstruct_monthly_cycle(symbol, y, m)
+                        bars = get_cycle_price_series(client, stock_obj, cycle.reference_expiry, cycle.pricing_expiry)
+                        all_trades.extend(simulate_cycle(cycle, bars, selected_strategies))
+                        all_level_events.extend(analyze_cycle(cycle, bars))
+                    except (HistoricalDataError, PriceSeriesError) as e:
+                        errors.append(str(e))
+            progress.empty()
+
+            st.session_state["bt_results"] = {
+                "trades": all_trades,
+                "level_events": all_level_events,
+                "errors": errors,
+            }
+
+    if "bt_results" in st.session_state:
+        result_data = st.session_state["bt_results"]
+        all_trades = result_data["trades"]
+        all_level_events = result_data["level_events"]
+        errors = result_data["errors"]
+
+        st.success(f"{len(all_trades)} trades simulated" + (f", {len(errors)} cycle(s) skipped" if errors else ""))
+        if errors:
+            with st.expander(f"{len(errors)} skipped cycles (DATA ERROR)"):
+                for e in errors:
+                    st.text(e)
+
+        if all_trades:
+            overall = compute_results(all_trades)
+            st.markdown("### Overall results")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total trades", overall.total_trades)
+            m1.metric("Win rate", f"{overall.win_rate_pct:.1f}%")
+            m2.metric("Net P&L (sum of trade %)", f"{overall.net_profit_pct:+.2f}%")
+            m2.metric("Expectancy / trade", f"{overall.expectancy_pct:+.2f}%")
+            m3.metric("Profit factor", f"{overall.profit_factor:.2f}" if overall.profit_factor else "N/A")
+            m3.metric("Max drawdown", f"{overall.max_drawdown_pct:.2f}%")
+            m4.metric("Avg holding days", f"{overall.avg_holding_days:.1f}")
+            m4.metric("Max consec. wins / losses", f"{overall.max_consecutive_wins} / {overall.max_consecutive_losses}")
+
+            trades_df = pd.DataFrame([t.__dict__ for t in all_trades]).sort_values("entry_date")
+            trades_df["cumulative_pnl_pct"] = trades_df["pnl_pct"].cumsum()
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=list(range(len(trades_df))), y=trades_df["cumulative_pnl_pct"], mode="lines+markers", name="Cumulative P&L %"))
+            fig.update_layout(height=350, title="Cumulative P&L (sum of trade %, chronological order)", xaxis_title="Trade #", yaxis_title="Cumulative %")
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("### By strategy")
+            by_strategy = compute_results_by_strategy(all_trades)
+            st.dataframe(
+                pd.DataFrame([{**{"strategy": name}, **r.__dict__} for name, r in by_strategy.items()]),
+                use_container_width=True,
+            )
+
+            st.markdown("### By level")
+            by_level = compute_results_by_level(all_trades)
+            st.dataframe(
+                pd.DataFrame([{**{"level": lvl}, **r.__dict__} for lvl, r in by_level.items()]),
+                use_container_width=True,
+            )
+
+            st.markdown("### Trade log")
+            st.dataframe(trades_df, use_container_width=True, height=400)
+
+        if all_level_events:
+            st.markdown("### Level performance statistics (Section 38)")
+            st.caption("Touch/bounce/rejection/breakout rates and average reaction, independent of any trading strategy.")
+            level_stats = aggregate_level_stats(all_level_events)
+            st.dataframe(
+                pd.DataFrame([r.__dict__ for r in level_stats.values()]),
+                use_container_width=True,
+            )

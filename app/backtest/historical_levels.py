@@ -22,7 +22,11 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 
 from app.backtest import bhavcopy
-from app.backtest.expiry_calendar import MonthlyExpiry, resolve_monthly_expiry
+from app.backtest.expiry_calendar import (
+    MonthlyExpiry,
+    UnsupportedHistoricalPeriodError,
+    resolve_monthly_expiry,
+)
 from app.engine import formulas
 from app.engine.adaptive_zone import compute_adaptive_zone_pct
 
@@ -71,9 +75,17 @@ def reconstruct_monthly_cycle(
     app.engine.adaptive_zone. Set False to use zone_pct literally, matching
     the spec's flat definition exactly.
     """
-    reference: MonthlyExpiry = resolve_monthly_expiry(symbol, year, month)
     next_year, next_month = (year, month + 1) if month < 12 else (year + 1, 1)
-    pricing: MonthlyExpiry = resolve_monthly_expiry(symbol, next_year, next_month)
+    try:
+        reference: MonthlyExpiry = resolve_monthly_expiry(symbol, year, month)
+        pricing: MonthlyExpiry = resolve_monthly_expiry(symbol, next_year, next_month)
+    except UnsupportedHistoricalPeriodError as e:
+        # Most commonly: the pricing month's expiry hasn't happened yet, so no
+        # bhavcopy exists for it to verify against -- that's the "not yet
+        # complete" case below, just discovered a different way. Re-raise as
+        # HistoricalDataError so every caller of this function only needs to
+        # catch one exception type for "this cycle isn't reconstructable".
+        raise HistoricalDataError(f"{symbol}: {e}") from e
 
     today = datetime.now(timezone.utc).date()
     if date.fromisoformat(pricing.expiry_date) >= today:
