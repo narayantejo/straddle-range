@@ -26,6 +26,7 @@ from app.data.dhan_constants import EXCHANGE_SEGMENT_NSE_EQ, INSTRUMENT_EQUITY
 from app.data.universe import FnoStock
 from app.db import database as db
 from app.engine import formulas
+from app.engine.adaptive_zone import compute_adaptive_zone_pct
 from app.engine.expiry import (
     ExpiryPair,
     ExpiryResolutionError,
@@ -114,7 +115,16 @@ def run_monthly_rollover(
     stock: FnoStock,
     zone_pct: float = config.DEFAULT_ZONE_PCT,
     today: date | None = None,
+    adaptive_zone: bool = True,
 ) -> RolloverResult:
+    """
+    zone_pct is the BASE zone% (spec Section 11's configurable default,
+    e.g. 5%). When adaptive_zone=True (default), the zone% actually applied
+    is scaled by this cycle's straddle relative to spot -- see
+    app.engine.adaptive_zone for why and how. Set adaptive_zone=False to use
+    zone_pct literally for every stock, matching the spec's flat definition
+    exactly.
+    """
     today = today or datetime.now(timezone.utc).date()
     try:
         expiry_pair: ExpiryPair = _resolve_expiry_pair_for_today(client, stock, today)
@@ -163,13 +173,21 @@ def run_monthly_rollover(
             f"(CE={atm_ce}, PE={atm_pe})"
         )
 
+    effective_zone_pct = zone_pct
+    if adaptive_zone:
+        effective_zone_pct = compute_adaptive_zone_pct(
+            straddle=float(atm_ce) + float(atm_pe),
+            spot_level=spot_level,
+            base_zone_pct=zone_pct,
+        )
+
     try:
         levels = formulas.compute_monthly_levels(
             spot_level=spot_level,
             atm_strike=atm_strike,
             atm_ce=float(atm_ce),
             atm_pe=float(atm_pe),
-            zone_pct=zone_pct,
+            zone_pct=effective_zone_pct,
         )
     except formulas.InvalidMarketDataError as e:
         raise MonthlyCalculationError(f"{stock.symbol}: {e}") from e
@@ -198,7 +216,7 @@ def run_monthly_rollover(
         r1_upper_zone=levels.r1_zone.upper,
         r2_lower_zone=levels.r2_zone.lower,
         r2_upper_zone=levels.r2_zone.upper,
-        zone_pct=zone_pct,
+        zone_pct=effective_zone_pct,
         calculation_timestamp=db.now_iso(),
         data_source="DhanHQ",
     )

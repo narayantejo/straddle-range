@@ -22,6 +22,20 @@ signal strength against those levels — with configurable alerts.
 - Resolves each stock's equity security ID, lot size, and nearest-expiry
   futures contract (for OI tracking) directly from the instrument master.
 
+### 2a. Adaptive zone width (`app/engine/adaptive_zone.py`)
+The spec's zone formula is a flat % of the level's price magnitude, which
+tends to produce zones that are wide relative to the actual S1/R1 spacing
+(set by the ATM premium, not the price) for lower-relative-IV stocks --
+confirmed on RELIANCE's 2026-07 cycle, where a flat 5% zone made R1's band
+swallow the entire cycle's trading range and overlap S1's own zone. This
+module scales the zone% INPUT continuously by (straddle / spot) relative to
+the spec's own worked example (12%, Section 10) -- the base zone% (default
+5%) applies unchanged at that reference volatility, tightening below it and
+widening above. `app.engine.formulas` itself is untouched and stays exactly
+spec-literal; this only changes what zone% value gets fed into it. Applied
+by default in both the live rollover and the backtest reconstruction
+(`adaptive_zone=True`); pass `False` to either to use a flat zone% instead.
+
 ### 2. Monthly S/R calculation engine (`app/engine/formulas.py`)
 Implements the exact spec formulas, unit-tested (including a mandatory test
 that fails if S1 is ever computed with ATM CE instead of ATM PE):
@@ -207,14 +221,46 @@ neither is a bug in this codebase:
   simply re-running `scripts/run_full_rollover.py` backfills exactly the
   stocks that failed.
 
+## Backtesting (`app/backtest/`, in progress on `develop`)
+
+Trades the underlying **equity/spot**, not actual CE/PE options, for backtest
+P&L — the level *calculation* still uses the real ATM CE+PE straddle (spec
+requirement, unchanged); only the strategy P&L simulation trades spot,
+sidestepping the historical option-data reliability problem below.
+
+- `bhavcopy.py`: downloads/caches NSE's official daily F&O Bhav Copy
+  (`archives.nseindia.com/content/fo/...`) — every stock/strike/expiry's
+  OHLC, settlement price, OI, and volume for a trading day, in one ~7s
+  download. Chosen over DhanHQ's `/charts/rollingoption` endpoint after
+  finding that one too slow (~30s/query) and unreliable (frequent 504s,
+  implausible prices on thin far-month contracts) to build a historical
+  dataset from.
+- `expiry_calendar.py`: resolves past monthly expiry dates, verified against
+  bhavcopy's own listed expiries. Deliberately scoped to the verified
+  current Tuesday-expiry regime (2025-09-01 onward) — NSE changed its
+  monthly expiry weekday twice in the ~18 months before that, so
+  reconstructing further back via a weekday rule isn't safe.
+- `historical_levels.py`: reconstructs past cycles' S1/S2/R1/R2 with strict
+  no-look-ahead, reusing the exact live formula/ATM-selection/adaptive-zone
+  code path. Rejects untraded (stale carry-forward) closing prices and
+  implausible straddle percentages rather than using them silently.
+- `price_series.py`: daily equity price path for a cycle (DhanHQ
+  `/charts/historical`, proven reliable — the option-data problem above
+  doesn't apply to plain equity OHLC).
+- `level_stats.py`: statistical level-performance analysis (spec Section
+  38) — touch rate, exact touch rate, bounce/rejection/breakout/breakdown
+  rate, average reaction, MFE/MAE — walking each cycle's price series
+  through the exact same classification functions the live scanner uses.
+
+Verified end-to-end against live data across the full available regime
+(Sept 2025 - Jul 2026, 22/22 stock-months succeeded).
+
+**Still to build**: the trade strategy simulator (entry/exit rules,
+stop-loss/target/max-hold, aggregate win-rate/profit-factor/drawdown stats
+per spec Section 37) and the Streamlit Backtest tab.
+
 ## Deferred (next phase)
 
-- **Backtesting engine** (spec sections 34-38): strategy configuration,
-  no-look-ahead historical reconstruction, trade statistics, level
-  performance analysis (touch/bounce/breakout rates). Needs real accumulated
-  `daily_scans` history to be meaningful — intentionally deferred until the
-  scanner has been run for a while.
-- **Statistical level-performance analysis**, built on the same history.
 - Option-activity (live option volume/OI) as a signal-scoring factor — the
   slot exists in `compute_signal_score()` but isn't populated yet, since
   re-querying the option chain daily would hit DhanHQ's option-chain rate

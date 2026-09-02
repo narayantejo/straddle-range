@@ -24,6 +24,7 @@ from datetime import date, datetime, timezone
 from app.backtest import bhavcopy
 from app.backtest.expiry_calendar import MonthlyExpiry, resolve_monthly_expiry
 from app.engine import formulas
+from app.engine.adaptive_zone import compute_adaptive_zone_pct
 
 DEFAULT_PLAUSIBLE_STRADDLE_BAND = (0.01, 0.30)  # 1%..30% of spot, sanity net
 
@@ -52,6 +53,7 @@ def reconstruct_monthly_cycle(
     zone_pct: float = 0.05,
     plausible_straddle_band: tuple[float, float] = DEFAULT_PLAUSIBLE_STRADDLE_BAND,
     require_traded_volume: bool = True,
+    adaptive_zone: bool = True,
 ) -> HistoricalCycle:
     """
     Reconstructs the monthly S/R levels that WOULD have been calculated at
@@ -62,6 +64,12 @@ def reconstruct_monthly_cycle(
     closing price that has zero traded volume that day -- NSE's bhavcopy
     carries forward the previous close for untraded contracts, which is not
     a fresh price and would silently corrupt the level calculation.
+
+    zone_pct is the BASE zone% (spec Section 11's configurable default).
+    adaptive_zone=True (default) scales it by this cycle's straddle relative
+    to spot, matching the live rollover's methodology -- see
+    app.engine.adaptive_zone. Set False to use zone_pct literally, matching
+    the spec's flat definition exactly.
     """
     reference: MonthlyExpiry = resolve_monthly_expiry(symbol, year, month)
     next_year, next_month = (year, month + 1) if month < 12 else (year + 1, 1)
@@ -119,12 +127,18 @@ def reconstruct_monthly_cycle(
             f"plausible band [{lo*100:.0f}%, {hi*100:.0f}%]."
         )
 
+    effective_zone_pct = zone_pct
+    if adaptive_zone:
+        effective_zone_pct = compute_adaptive_zone_pct(
+            straddle=straddle, spot_level=spot_level, base_zone_pct=zone_pct
+        )
+
     levels = formulas.compute_monthly_levels(
         spot_level=spot_level,
         atm_strike=atm_strike,
         atm_ce=atm_ce,
         atm_pe=atm_pe,
-        zone_pct=zone_pct,
+        zone_pct=effective_zone_pct,
     )
 
     return HistoricalCycle(
