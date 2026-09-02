@@ -20,7 +20,7 @@ from typing import Any
 import requests
 
 from app import config
-from app.data.dhan_constants import INSTRUMENT_MASTER_DETAILED_URL
+from app.data.dhan_constants import EXCHANGE_SEGMENT_NSE_FNO, INSTRUMENT_MASTER_DETAILED_URL
 
 BASE_URL = "https://api.dhan.co/v2"
 
@@ -51,7 +51,10 @@ class DhanClient:
 
     def _post(self, path: str, payload: dict[str, Any], _retry: int = 0) -> dict[str, Any]:
         url = f"{BASE_URL}{path}"
-        resp = self._session.post(url, json=payload, timeout=30)
+        try:
+            resp = self._session.post(url, json=payload, timeout=30)
+        except requests.exceptions.RequestException as e:
+            raise DhanApiError(f"POST {path} network error: {e}") from e
         if resp.status_code == 429 and _retry < 3:
             time.sleep(2.0 * (_retry + 1))
             return self._post(path, payload, _retry=_retry + 1)
@@ -166,6 +169,80 @@ class DhanClient:
                 f"{from_date}..{to_date}: {body}"
             )
         return body
+
+    # ------------------------------------------------------------------
+    # Expired options data (historical option premiums/OI/volume)
+    # ------------------------------------------------------------------
+    def get_expired_option_data(
+        self,
+        security_id: int,
+        expiry_flag: str,
+        strike: str,
+        option_type: str,
+        date_str: str,
+        required_data: list[str],
+        expiry_code: int = 1,
+        interval: int = 1,
+        max_retries: int = 3,
+    ) -> dict[str, list]:
+        """
+        Historical (expired) option data via /v2/charts/rollingoption.
+
+        IMPORTANT: unlike /charts/historical, this endpoint's toDate is
+        INCLUSIVE -- fromDate == toDate == date_str returns exactly one
+        trading day. Passing a wider range silently blends multiple days'
+        minute bars together with no day boundary marker other than the
+        timestamp array, so callers MUST pass a single date and filter by
+        timestamp if they need anything more precise.
+
+        This endpoint is empirically flaky (observed ~30% of calls return an
+        empty body even on valid requests) -- retried internally with a
+        short backoff, separate from the 429 retry in _post().
+
+        expiry_code: 1 = the nearest expiry matching expiry_flag counted
+        forward from date_str (verified empirically: expiry_code=1 with
+        expiry_flag="MONTH" resolves to the next monthly expiry after
+        date_str; 0 is rejected by the API as invalid).
+        strike: "ATM", or "ATM+1".."ATM+3"/"ATM-1".."ATM-3" (stock options;
+        wider ATM±10 range applies to index options per DhanHQ docs).
+        option_type: "CALL" or "PUT".
+
+        Returns the raw {"ce": {...}} or {"pe": {...}} sub-dict (whichever
+        matches option_type), each field a list aligned by index with a
+        "timestamp" list (epoch seconds, IST trading session).
+        """
+        payload = {
+            "securityId": str(security_id),
+            "interval": interval,
+            "exchangeSegment": EXCHANGE_SEGMENT_NSE_FNO,
+            "instrument": "OPTSTK",
+            "fromDate": date_str,
+            "toDate": date_str,
+            "expiryCode": expiry_code,
+            "expiryFlag": expiry_flag,
+            "strike": strike,
+            "drvOptionType": option_type,
+            "requiredData": required_data,
+        }
+        last_error: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                body = self._post("/charts/rollingoption", payload)
+            except DhanApiError as e:
+                last_error = e
+                time.sleep(3.0 * (attempt + 1))
+                continue
+            data = body.get("data")
+            key = "ce" if option_type == "CALL" else "pe"
+            if not data or not data.get(key) or not data[key].get("close"):
+                last_error = DhanApiError(
+                    f"Empty expired-option data for security_id={security_id} "
+                    f"date={date_str} strike={strike} type={option_type}"
+                )
+                time.sleep(3.0 * (attempt + 1))
+                continue
+            return data[key]
+        raise last_error or DhanApiError("get_expired_option_data failed with no error captured")
 
     # ------------------------------------------------------------------
     # Market quote / LTP
