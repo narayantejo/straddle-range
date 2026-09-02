@@ -1,0 +1,11 @@
+dhanhq>=2.0.2
+# Pinned: streamlit>=1.60 has a regression where `with st.sidebar:` renders nothing
+# (verified 2026-08-29 against 1.62.0). Revisit the pin once that's fixed upstream.
+streamlit==1.38.0
+plotly>=5.22
+pandas>=2.2
+numpy>=1.26
+python-dotenv>=1.0
+requests>=2.32
+pytest>=8.0
+apscheduler>=3.10

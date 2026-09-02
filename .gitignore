@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.db
+*.sqlite3
+data/cache/
+.streamlit/secrets.toml
+.pytest_cache/
+
+# Personal local launcher scripts (machine-specific paths, not for distribution)
+KG BAT.BAT
+batch file for running.txt
