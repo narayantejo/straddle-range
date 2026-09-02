@@ -221,7 +221,7 @@ neither is a bug in this codebase:
   simply re-running `scripts/run_full_rollover.py` backfills exactly the
   stocks that failed.
 
-## Backtesting (`app/backtest/`, in progress on `develop`)
+## Backtesting (`app/backtest/`, on `develop`)
 
 Trades the underlying **equity/spot**, not actual CE/PE options, for backtest
 P&L — the level *calculation* still uses the real ATM CE+PE straddle (spec
@@ -251,13 +251,29 @@ sidestepping the historical option-data reliability problem below.
   38) — touch rate, exact touch rate, bounce/rejection/breakout/breakdown
   rate, average reaction, MFE/MAE — walking each cycle's price series
   through the exact same classification functions the live scanner uses.
+- `strategy.py` / `simulator.py`: trade strategy simulation (spec Sections
+  34-37) — six default strategies (Support Bounce, Resistance Rejection,
+  R1/R2 Breakout, S1/S2 Breakdown) with configurable stop-loss/target/max-
+  holding-period exits. No-look-ahead: walks daily bars chronologically,
+  using the exact same `classify_reaction()` the live scanner would
+  produce that day to decide entries. A same-bar stop/target ambiguity
+  resolves to the stop (conservative). P&L is a simple per-trade % return,
+  not a compounded/capital-sized equity curve.
+- `results.py`: aggregate stats (win rate, profit factor, expectancy, max
+  drawdown, consecutive win/loss streaks), overall and broken down by
+  level and strategy.
 
-Verified end-to-end against live data across the full available regime
-(Sept 2025 - Jul 2026, 22/22 stock-months succeeded).
+Exposed in the dashboard's **Backtest** tab: pick stocks, a date range
+(within the supported regime), strategies, and exit parameters; see
+overall/by-level/by-strategy results, a cumulative P&L chart, the full
+trade log, and Section 38 level-performance stats.
 
-**Still to build**: the trade strategy simulator (entry/exit rules,
-stop-loss/target/max-hold, aggregate win-rate/profit-factor/drawdown stats
-per spec Section 37) and the Streamlit Backtest tab.
+Verified end-to-end against live data (RELIANCE, Sept 2025 - Aug 2026): 46
+trades simulated across 11 complete cycles (the 12th, still in progress,
+correctly skipped with an informative message), with plausible,
+differentiated per-level statistics -- e.g. S1 touch rate 91% / bounce rate
+20% / breakdown rate 30%; R1 touch rate 82% / breakout rate 44% / rejection
+rate 33%.
 
 ## Deferred (next phase)
 
